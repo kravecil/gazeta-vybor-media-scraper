@@ -1,13 +1,13 @@
 import argparse
 import asyncio
+import base64
 import logging
 import os
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-import aiohttp
-from playwright.async_api import ElementHandle, async_playwright
+from playwright.async_api import ElementHandle, Page, async_playwright
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,13 +24,7 @@ DEFAULT_DIR = "downloaded_images"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download images from a list of URLs.")
-    parser.add_argument(
-        "url",
-        # TODO @me remove constant url
-        default="https://gazetavibor.ru/news/novosti/2026-06-26/v-salavate-otmetili-vypusknoy-bally-bal-2026-4732758",
-        nargs=None,
-        help="URL to download images from.",
-    )
+    parser.add_argument("url", nargs=None, help="URL to download images from.")
     parser.add_argument(
         "--dir", default=DEFAULT_DIR, help="Directory to save downloaded images."
     )
@@ -67,29 +61,64 @@ async def scroll_to_bottom(
         )
 
 
-async def fetch_images(urls: list[str], dir: str, concurrent_limit: int = 10) -> int:
-    connector = aiohttp.TCPConnector(limit=concurrent_limit)
-    timeout = aiohttp.ClientTimeout(total=30)
+async def fetch_images(
+    page: Page, urls: list[str], dir: str, concurrent_limit: int = 10
+) -> int:
+    semaphore = asyncio.Semaphore(concurrent_limit)
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = [download_image(session, url, dir) for url in urls]
-        results = await asyncio.gather(*tasks)
+    async def _limited_fetch(url: str) -> bool:
+        async with semaphore:
+            return await download_image(page, url, dir)
 
-        return sum(results)
+    tasks = [_limited_fetch(url) for url in urls]
+    results = await asyncio.gather(*tasks)
+
+    return sum(results)
 
 
-async def download_image(session: aiohttp.ClientSession, url: str, dir: str) -> bool:
+async def download_image(page: Page, url: str, dir: str) -> bool:
     try:
-        async with session.get(url) as response:
-            path = urlparse(url).path
-            original_name = Path(path).name or "img"
+        result = await page.evaluate(
+            """
+            async (url) => {
+                try {
+                    const response = await fetch(url, { credentials: 'include' });
+                    if (!response.ok) return null;
 
-            filepath = os.path.join(dir, original_name)
+                    const blob = await response.blob();
+                    const arrayBuffer = await blob.arrayBuffer();
+                    const bytes = new Uint8Array(arrayBuffer);
 
-            with open(filepath, "wb") as f:
-                f.write(await response.read())
+                    // Convert to base64 for transfer to Python
+                    let binary = '';
+                    for (let i = 0; i < bytes.byteLength; i++) {
+                        binary += String.fromCharCode(bytes[i]);
+                    }
+                    return btoa(binary);
+                } catch (e) {
+                    console.error('Fetch error:', url, e);
+                    return null;
+                }
+            }
+        """,
+            url,
+        )
 
-            return True
+        if not result:
+            logger.warning(f"⚠️ Failed or blocked fetch for {url}")
+            return False
+
+        image_data = base64.b64decode(result)
+
+        path = urlparse(url).path
+        original_name = Path(path).name or "img"
+
+        filepath = os.path.join(dir, original_name)
+
+        with open(filepath, "wb") as f:
+            f.write(image_data)
+
+        return True
     except Exception as e:
         logger.error(f"Failed to download image from {url}: {e}")
         return False
@@ -134,23 +163,24 @@ async def main():
 
         image_urls: list[str] = []
         for locator in images_locator:
-            src = await locator.get_attribute("src")
+            src_handle = await locator.get_property("src")
 
-            if src is None:
+            if not src_handle:
+                continue
+            src = await src_handle.json_value()
+            if not src:
                 continue
 
             image_urls.append(src)
 
+        logger.info(f"Found {len(image_urls)} images.")
+
+        logger.info("Fetching images...")
+        success_fetch_count = await fetch_images(page, image_urls, args.dir)
+
+        logger.info(f"Successful fetched {success_fetch_count} images.")
+
         await browser.close()
-
-    image_urls = image_urls[:5]  # TODO @me: remove, for testing only
-
-    logger.info(f"Found {len(image_urls)} images.")
-
-    logger.info("Fetching images...")
-    success_fetch_count = await fetch_images(image_urls, args.dir, args.concurrent)
-
-    logger.info(f"Successful fetched {success_fetch_count} images.")
 
     logger.info("Done.")
 
